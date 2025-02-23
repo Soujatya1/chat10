@@ -1,151 +1,96 @@
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+from langchain_community.document_loaders import PDFPlumberLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.embeddings import HuggingFaceEmbeddings
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+st.title("Document GeN-ie")
+st.subheader("Chat with your documents")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+template = """
+You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. As per the question asked, please mention the accurate and precise related information. Use point-wise format, if required .
+Also answer situation-based questions derived from the context as per the question.
+Question: {question} 
+Context: {context} 
+Answer:
+"""
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+pdfs_directory = '.github/'
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vector_store = InMemoryVectorStore(embeddings)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+model = ChatGroq(groq_api_key="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", model_name="llama-3.3-70b-versatile", temperature=0)
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+def upload_pdf(file):
+    file_path = pdfs_directory + file.name
+    with open(file_path, "wb") as f:
+        f.write(file.getbuffer())
+    return file_path
+
+def load_pdf(file_path):
+    loader = PDFPlumberLoader(file_path)
+    documents = loader.load()
+    return documents
+
+def split_text(documents):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        add_start_index=True
     )
+    return text_splitter.split_documents(documents)
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+def index_docs(documents):
+    vector_store.add_documents(documents)
 
-    return gdp_df
+def retrieve_docs(query):
+    return vector_store.similarity_search(query)
 
-gdp_df = get_gdp_data()
+def answer_question(question, documents):
+    context = "\n\n".join([doc.page_content for doc in documents])
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | model
+    
+    response = chain.invoke({"question": question, "context": context})
+    
+    return response.content
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+if "conversation_history" not in st.session_state:
+    st.session_state.conversation_history = []
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+uploaded_file = st.file_uploader(
+    "Upload PDF",
+    type="pdf",
+    accept_multiple_files=True
 )
 
-''
-''
+if uploaded_file:
+    all_documents = []
 
+    for uploaded_file in uploaded_file:
+        file_path = upload_pdf(uploaded_file)
+        documents = load_pdf(file_path)
+        chunked_documents = split_text(documents)
+        all_documents.extend(chunked_documents)
+    index_docs(all_documents)
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+    question = st.chat_input("Ask a question:")
 
-st.header(f'GDP in {to_year}', divider='gray')
+    if question:
+        st.session_state.conversation_history.append({"role": "user", "content": question})
+        
+        related_documents = retrieve_docs(question)
+        
+        answer = answer_question(question, related_documents)
+        
+        st.session_state.conversation_history.append({"role": "assistant", "content": answer})
 
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    for message in st.session_state.conversation_history:
+        if message["role"] == "user":
+            st.chat_message("user").write(message["content"])
+        elif message["role"] == "assistant":
+            st.chat_message("assistant").write(message["content"])
